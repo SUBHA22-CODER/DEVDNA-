@@ -1,0 +1,284 @@
+"""Controlled experiment execution and prediction-vs-observation comparison.
+
+Execution policy (enforced in `choose_mode`):
+  * Only the bundled, trusted sample project runs in the local restricted harness.
+  * Any uploaded / local project requires Docker (no network, read-only source,
+    memory/CPU/pid limits). Without Docker the experiment is BLOCKED.
+  * The test command is fixed (`python -m pytest ...`); no user-supplied commands
+    are ever executed.
+
+Local harness restrictions: a disposable copy of the project in a temp folder,
+a scrubbed environment (no API keys or server secrets), outbound network blocked
+by the fault plugin, a hard timeout, output size caps and full cleanup.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from app.analyzer.redact import redact
+from app.config import settings
+
+HARNESS_DIR = Path(__file__).resolve().parent / "harness"
+SANDBOX_IMAGE = "devdna-sandbox:latest"
+MAX_OUTPUT_CHARS = 20000
+COPY_IGNORE = shutil.ignore_patterns(".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "*.db",
+                                     "*.sqlite", "*.sqlite3", ".env", ".env.*")
+
+
+def docker_available() -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        r = subprocess.run(["docker", "image", "inspect", SANDBOX_IMAGE], capture_output=True, timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def choose_mode(trusted: bool) -> tuple[str, str | None]:
+    if trusted:
+        return "local_harness", None
+    if docker_available():
+        return "docker", None
+    return "blocked", ("This project was uploaded or loaded from disk, so its code is untrusted. Untrusted code only runs "
+                       f"inside the Docker sandbox image '{SANDBOX_IMAGE}', and Docker or that image is not available on this "
+                       "machine. No code was executed.")
+
+
+def fault_spec(impact: dict) -> dict:
+    if impact.get("custom_fault"):
+        return impact["custom_fault"]
+    target = impact["target"]
+    data = target.get("data", {})
+    scenario = impact["scenario"]
+    if scenario == "db_unavailable":
+        return {"kind": scenario, "engine": data.get("engine")}
+    if scenario == "external_api_unavailable":
+        return {"kind": scenario, "hint": data.get("hint")}
+    if scenario == "missing_env_var":
+        return {"kind": scenario, "var": target["name"]}
+    if scenario == "worker_unavailable":
+        return {"kind": scenario, "module": data.get("module"), "cls": data.get("cls"),
+                "launchers": data.get("launcher_methods", [])}
+    return {
+        "kind": "dynamic_fault",
+        "scenario": scenario,
+        "target_id": target.get("id"),
+        "target_type": target.get("type"),
+        "target_name": target.get("name"),
+        "target_data": data,
+        "exceptions": impact.get("relevant_exceptions", ["RuntimeError"]),
+        "fault_description": impact.get("fault_description", ""),
+    }
+
+
+def _scrubbed_env(workdir: Path, project_dir: Path, fault: dict | None, report: Path) -> dict:
+    env = {
+        "PYTHONPATH": os.pathsep.join([str(HARNESS_DIR), str(project_dir)]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONIOENCODING": "utf-8",
+        "TMP": str(workdir), "TEMP": str(workdir), "TMPDIR": str(workdir),
+        "HOME": str(workdir), "USERPROFILE": str(workdir),
+        "DEVDNA_FAULT": json.dumps(fault) if fault else "",
+        "DEVDNA_FAULT_REPORT": str(report),
+        "NO_PROXY": "*",
+    }
+    for key in ("SYSTEMROOT", "PATH", "COMSPEC", "PATHEXT", "WINDIR"):  # required for Python to start on Windows
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
+def _posix_limits():  # pragma: no cover - not available on Windows
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_AS, (1024 ** 3, 1024 ** 3))
+    resource.setrlimit(resource.RLIMIT_CPU, (settings.experiment_timeout_s, settings.experiment_timeout_s))
+    resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
+
+
+def parse_junit(path: Path) -> dict[str, dict]:
+    results: dict[str, dict] = {}
+    if not path.exists():
+        return results
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return results
+    for case in root.iter("testcase"):
+        name = case.get("name", "").split("[")[0]
+        key = f"{case.get('classname', '')}::{name}"
+        outcome, message = "passed", ""
+        for tag in ("failure", "error", "skipped"):
+            el = case.find(tag)
+            if el is not None:
+                outcome = {"failure": "failed", "error": "error", "skipped": "skipped"}[tag]
+                message = redact((el.get("message") or "") + "\n" + (el.text or ""))[0][-1500:]
+                break
+        prev = results.get(key)
+        if prev and prev["outcome"] in ("failed", "error"):
+            continue  # parametrised: any failure wins
+        results[key] = {"outcome": outcome, "message": message, "time": float(case.get("time") or 0)}
+    return results
+
+
+def _run_pytest(project_dir: Path, workdir: Path, fault: dict | None, label: str, mode: str) -> dict:
+    xml = workdir / f"{label}.xml"
+    report = workdir / f"{label}-fault.json"
+    args = ["-m", "pytest", "-q", "-p", "devdna_faults", "-p", "no:cacheprovider", f"--junitxml={xml}",
+            "-o", "junit_family=xunit2", "--tb=short", "-rfE", "--color=no"]
+    env = _scrubbed_env(workdir, project_dir, fault, report)
+    started = time.monotonic()
+    if mode == "docker":  # pragma: no cover - requires Docker
+        cmd = ["docker", "run", "--rm", "--network", "none", "--memory", "512m", "--cpus", "1", "--pids-limit", "128",
+               "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+               "-v", f"{project_dir}:/src:ro", "-v", f"{HARNESS_DIR}:/harness:ro", "-v", f"{workdir}:/out:rw",
+               "-e", "PYTHONPATH=/harness:/src", "-e", f"DEVDNA_FAULT={env['DEVDNA_FAULT']}",
+               "-e", f"DEVDNA_FAULT_REPORT=/out/{report.name}", "-w", "/src", SANDBOX_IMAGE,
+               "python", *[a.replace(str(xml), f"/out/{xml.name}") for a in args]]
+        kwargs = {}
+    else:
+        cmd = [sys.executable, *args]
+        kwargs = {"env": env, "cwd": str(project_dir)}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:  # pragma: no cover
+            kwargs["preexec_fn"] = _posix_limits
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=settings.experiment_timeout_s, **kwargs)
+        timed_out, code, out = False, proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        timed_out, code = True, None
+        out = ((exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
+    duration = round(time.monotonic() - started, 2)
+    out = redact(out.replace(str(workdir), "<sandbox>"))[0]
+    fault_state = {}
+    if report.exists():
+        try:
+            fault_state = json.loads(report.read_text(encoding="utf-8"))
+        except ValueError:
+            fault_state = {"errors": ["fault report unreadable"]}
+    results = parse_junit(xml)
+    counts = {k: sum(1 for r in results.values() if r["outcome"] == k) for k in ("passed", "failed", "error", "skipped")}
+    return {
+        "label": label, "exit_code": code, "timed_out": timed_out, "duration_s": duration,
+        "output": out[-MAX_OUTPUT_CHARS:], "output_truncated": len(out) > MAX_OUTPUT_CHARS,
+        "results": results, "counts": counts, "fault_state": fault_state,
+    }
+
+
+def execute(project_dir: Path, fault: dict, mode: str) -> dict:
+    """Run the project's tests twice (baseline, then with the fault) in a disposable copy."""
+    workdir = Path(tempfile.mkdtemp(prefix="devdna-exp-"))
+    try:
+        sandbox_project = workdir / "project"
+        shutil.copytree(project_dir, sandbox_project, ignore=COPY_IGNORE)
+        baseline = _run_pytest(sandbox_project, workdir, None, "baseline", mode)
+        faulted = _run_pytest(sandbox_project, workdir, fault, "faulted", mode)
+        return {"mode": mode, "command": "python -m pytest -q (fixed command; plugin devdna_faults)",
+                "baseline": baseline, "faulted": faulted, "fault": fault}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def compare(impact: dict, observation: dict) -> dict:
+    """Compare per-test predictions with observed outcomes. Pure function (unit tested)."""
+    base = observation["baseline"]
+    fault = observation["faulted"]
+    notes: list[str] = []
+    if base["timed_out"] or fault["timed_out"]:
+        return {"status": "inconclusive", "reason": "A test run hit the time limit.", "rows": [], "metrics": {}, "notes": notes}
+    if not base["results"]:
+        return {"status": "inconclusive", "reason": "The baseline run produced no test results (tests could not be collected).",
+                "rows": [], "metrics": {}, "notes": notes}
+    if fault["fault_state"].get("errors"):
+        return {"status": "inconclusive", "reason": "Fault injection reported errors: " + "; ".join(fault["fault_state"]["errors"]),
+                "rows": [], "metrics": {}, "notes": notes}
+
+    rows = []
+    predicted_keys = set()
+    for t in impact["tests"]:
+        key = t.get("junit_key")
+        predicted_keys.add(key)
+        b = base["results"].get(key)
+        f = fault["results"].get(key)
+        row = {"test": t["name"], "nodeid": t.get("nodeid"), "prediction": t["prediction"], "path": t.get("path", []),
+               "handled_at": t.get("handled_at"),
+               "baseline": b["outcome"] if b else "not_run", "observed": f["outcome"] if f else "not_run",
+               "message": (f or {}).get("message", "")[-600:], "fault_marker": "DevDNA injected fault" in (f or {}).get("message", "")}
+        observed_failed = row["observed"] in ("failed", "error")
+        if row["baseline"] != "passed":
+            row["verdict"] = "excluded"
+            row["why"] = "Test did not pass in the baseline run, so it cannot show the effect of the fault."
+        elif row["observed"] == "not_run":
+            row["verdict"] = "excluded"
+            row["why"] = "Test did not run in the faulted run."
+        elif t["prediction"] == "fail":
+            row["verdict"] = "match" if observed_failed else "mismatch"
+        elif t["prediction"] == "pass":
+            row["verdict"] = "mismatch" if observed_failed else "match"
+        else:
+            row["verdict"] = "uncertain_failed" if observed_failed else "uncertain_passed"
+        rows.append(row)
+    unmapped = [k for k in fault["results"] if k not in predicted_keys]
+    if unmapped:
+        notes.append(f"{len(unmapped)} executed test(s) were not mapped to the graph: {', '.join(unmapped[:5])}")
+
+    tp = sum(1 for r in rows if r["prediction"] == "fail" and r["verdict"] == "match")
+    fp = sum(1 for r in rows if r["prediction"] == "fail" and r["verdict"] == "mismatch")
+    tn = sum(1 for r in rows if r["prediction"] == "pass" and r["verdict"] == "match")
+    fn = sum(1 for r in rows if r["prediction"] == "pass" and r["verdict"] == "mismatch")
+    unc_f = sum(1 for r in rows if r["verdict"] == "uncertain_failed")
+    unc_p = sum(1 for r in rows if r["verdict"] == "uncertain_passed")
+    definite = tp + fp + tn + fn
+    metrics = {
+        "true_positive": tp, "false_positive": fp, "true_negative": tn, "false_negative": fn,
+        "uncertain_failed": unc_f, "uncertain_passed": unc_p,
+        "excluded": sum(1 for r in rows if r["verdict"] == "excluded"),
+        "accuracy": round((tp + tn) / definite, 3) if definite else None,
+        "precision": round(tp / (tp + fp), 3) if (tp + fp) else None,
+        "recall": round(tp / (tp + fn), 3) if (tp + fn) else None,
+        "fault_triggers": fault["fault_state"].get("triggers", 0),
+    }
+    triggers = metrics["fault_triggers"]
+    if triggers == 0:
+        status, reason = "inconclusive", "The injected fault was never triggered, so the run says nothing about this failure."
+    elif definite == 0:
+        status, reason = "inconclusive", "No test had a definite prediction that could be checked."
+    elif fp == 0 and fn == 0:
+        status, reason = "prediction_confirmed", f"All {definite} definite test predictions matched the observed outcomes."
+    elif tp == 0 and tn == 0:
+        status, reason = "prediction_contradicted", "None of the definite test predictions matched the observed outcomes."
+    else:
+        status, reason = "partially_confirmed", f"{tp + tn} of {definite} definite test predictions matched; {fp + fn} did not."
+    if unc_f or unc_p:
+        notes.append(f"Uncertain (error handled on path) tests: {unc_f} failed, {unc_p} passed.")
+    notes.append("This result covers this test suite under this injected fault only. It does not guarantee production behaviour.")
+
+    ai_reconciliation = {
+        "verdict_summary": f"DevDNA Empirical Verification: {definite} definite test prediction(s) reconciled against live pytest sandbox fault run.",
+        "confusion_matrix": {
+            "true_positive": tp,
+            "false_positive": fp,
+            "true_negative": tn,
+            "false_negative": fn,
+            "accuracy": round((tp + tn) / definite, 3) if definite else None,
+        },
+        "discrepancy_attribution": [
+            f"Test '{r['test']}': predicted '{r['prediction']}' but observed '{r['observed']}' (message: {r.get('message', '')[:120]})."
+            for r in rows if r["verdict"] == "mismatch"
+        ][:5],
+        "neuro_symbolic_grade": "A+" if (fp == 0 and fn == 0 and definite > 0) else ("B" if (tp + tn) > (fp + fn) else "C"),
+    }
+
+    return {"status": status, "reason": reason, "rows": rows, "metrics": metrics, "notes": notes, "ai_reconciliation": ai_reconciliation}

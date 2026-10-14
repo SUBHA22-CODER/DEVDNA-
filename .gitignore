@@ -1,0 +1,41 @@
+# Secrets & Credentials
+.env
+.env.*
+backend/.env
+!.env.example
+backend/!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Databases & local state
+backend/data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Node & Build artifacts
+node_modules/
+frontend/dist/
+dist/
+build/
+*.timestamp-*.mjs
+
+# IDE, OS & Agent Tools
+.agents/
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
