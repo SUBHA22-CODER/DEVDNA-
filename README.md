@@ -34,15 +34,25 @@ In growing Python systems, answering a deceptively simple question is notoriousl
 
 ---
 
-## 2. The Solution: A Deterministic Software Digital Twin
+## 2. The Solution: A Neuro-Symbolic Software Digital Twin
 
-DevDNA constructs an evidence-backed **digital twin** of any Python repository. It computes deterministic failure blast radius through reverse graph search, reasons about failure mechanisms using Google Gemma 4, and then **empirically validates the prediction** inside an isolated pytest fault-injection sandbox.
+DevDNA constructs a **Neuro-Symbolic Digital Twin** of any Python codebase. Unlike naive AI wrappers that hallucinate call graphs, or purely static tools that cannot reason about semantic runtime behavior, DevDNA fuses both paradigms:
+
+* **The Symbolic Engine (AST MultiDiGraph):** Mathematically maps dependencies, call sites, and exception handlers directly from syntax trees with zero hallucinations.
+* **The Neural Engine (Google Gemma 4):** Visually ingests architecture diagrams for drift detection, synthesizes arbitrary failure scenarios from natural language, calculates cascading runtime risk, and reconciles empirical test results.
 
 ```
-DISCOVER  ───────►  VISUALIZE  ───────►  PREDICT  ───────►  EXPERIMENT  ───────►  COMPARE
-Static AST          Interactive          Dual Reverse       Controlled           Empirical
-Analysis            Topology Graph       BFS + Gemma 4      pytest Sandbox       Confusion Matrix
-(Zero Execution)    (React Flow)         (Definite/Poss)    (Fault Injection)    (TP, FP, TN, FN)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        DevDNA Neuro-Symbolic Digital Twin                              │
+├───────────────────────────────┬────────────────────────────────────────────────────────┤
+│   SYMBOLIC GRAPH CO-PROCESSOR │ Deterministic AST Parser • Call Sites • NetworkX DAG  │
+├───────────────────────────────┼────────────────────────────────────────────────────────┤
+│   GEMMA 4 COGNITIVE ENGINE    │ Multimodal Diagram Audit • Arbitrary Chaos Synthesis   │
+│                               │ Neural Risk Scoring • Empirical Post-Mortem Analysis   │
+├───────────────────────────────┼────────────────────────────────────────────────────────┤
+│   EMPIRICAL PYTEST SANDBOX    │ Isolated Subprocess/Docker • Fault Injection Plugin    │
+│                               │ JUnit XML Confusion Matrix (TP, FP, TN, FN)           │
+└───────────────────────────────┴────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -79,21 +89,21 @@ Analysis            Topology Graph       BFS + Gemma 4      pytest Sandbox      
 
 ## 4. Key Engineering Capabilities
 
-1. **Static AST Analysis (Zero Code Execution During Ingestion):**
+1. **Gemma 4 Multimodal Visual Architecture Audit:**
+   * Uses Google's official Gen AI SDK (`types.Part.from_bytes`) to visually inspect uploaded C4 diagrams, cloud topologies, whiteboard sketches, or terminal error screenshots.
+   * Compares the visual diagram against ground-truth AST code to detect architectural drift, unmitigated single points of failure, and implementation gaps.
+2. **Gemma 4 Dynamic Chaos Scenario Synthesizer:**
+   * Allows developers to express arbitrary failure modes in natural language (e.g., *"Redis connection drop & cache eviction storm"* or *"JWT token expiration cascade"*).
+   * Gemma 4 inspects the AST code, identifies target components and exception hierarchies, and generates runtime fault specifications.
+3. **Neuro-Symbolic Blast Radius Engine:**
+   * Combines dual reverse graph reachability bounds with Gemma 4 runtime risk evaluation (0-100 risk score, semantic failure mechanisms, and unverified route coverage gaps).
+   * Differentiates **Definite** paths from **Possible** (conditionally handled) paths.
+4. **Empirical What-If Lab (Controlled Fault Injection):**
+   * Executes the repository's real `pytest` suite twice: baseline healthy run, then faulted run using the `devdna_faults` pytest plugin.
+   * Compares predictions against observed JUnit XML outcomes to compute True Positives, False Positives, True Negatives, and False Negatives with AI discrepancy attribution.
+5. **Static AST Ingestion (Zero Code Execution During Ingestion):**
    * Uses Python's native `ast` module to scan functions, routes, database sessions, environment variable reads, and outbound HTTP clients.
    * Every discovered edge carries source file, line number, a redacted code snippet, and evidence classification (`confirmed` vs `inferred`).
-2. **Deterministic Dual Reverse BFS Propagation:**
-   * Traverses callers backward from a failure point.
-   * Understands `try-except` blocks: an edge protected by an exception handler that catches the failure without re-raising is marked as **Possible** (uncertain) instead of **Definite**.
-3. **Component Criticality Score ($0 - 100$):**
-   * Combines blast radius, normalized betweenness centrality, and user-facing HTTP route share into a single structural risk metric.
-4. **Empirical What-If Lab (Controlled Fault Injection):**
-   * Runs the project's own `pytest` suite twice: baseline healthy run, then faulted run using the `devdna_faults` pytest plugin.
-   * Evaluates predictions against observed JUnit XML results to compute True Positives, False Positives, True Negatives, and False Negatives.
-5. **Grounded Gemma 4 AI Analysis (`gemma-4-26b-a4b-it`):**
-   * Accesses Gemma 4 server-side via the official Google Gen AI SDK.
-   * All explanations are strictly constrained to cited evidence tokens ($E_1 \dots E_n$). Gemma explains *why* a failure occurs; it never decides *which* components are affected.
-   * Features client-side consent review, Pydantic schema validation, and automatic exponential backoff retry.
 
 ---
 
@@ -123,15 +133,16 @@ flowchart LR
     subgraph Frontend["React 18 Frontend"]
         UI[Overview & What-If Lab]
         GraphView[React Flow Topology Graph]
+        MultiModal[Multimodal Diagram Inspector]
         Theme[Dark / Bright Theme Engine]
     end
 
     subgraph Backend["FastAPI Backend"]
         Ingest[ZIP & Local Path Ingestion]
         AST[Python AST Analyzer]
-        Engine[NetworkX MultiDiGraph Engine]
+        Engine[Neuro-Symbolic Engine]
         Runner[What-If Experiment Runner]
-        Gemma[Gemma 4 Service]
+        Gemma[Gemma 4 Service: Text + Vision]
         Store[(SQLite Analysis Store)]
     end
 
@@ -154,11 +165,11 @@ flowchart LR
 
 | Layer | Technologies | Responsibilities |
 | :--- | :--- | :--- |
+| **Cognitive AI Core** | Google Gemma 4 26B (`gemma-4-26b-a4b-it`), Google Gen AI SDK | Multimodal visual architecture audits, dynamic chaos scenario synthesis, neuro-symbolic risk evaluation |
 | **Backend API** | Python 3.11+, FastAPI, Uvicorn, Pydantic v2, SQLAlchemy, SQLite | High-performance async REST service, analysis persistence, schema validation |
 | **Static Analysis** | Python native `ast`, NetworkX | AST visitor traversal, call-site resolution, directed dependency multi-graph |
-| **Testing & Faults** | `pytest`, custom `devdna_faults` plugin, JUnit XML parser | Baseline vs. faulted test execution, socket/db/env interception |
-| **Open Source AI** | Google Gemma 4 26B (`gemma-4-26b-a4b-it`), Google Gen AI SDK | Evidence-grounded architectural summaries and failure mitigation recommendations |
-| **Frontend Web** | React 18, Vite, Tailwind CSS 4, Framer Motion, `@xyflow/react` | Interactive graph visualization, reactive what-if lab, dual theming |
+| **Testing & Faults** | `pytest`, custom `devdna_faults` plugin, JUnit XML parser | Baseline vs. faulted test execution, socket/db/env/dynamic fault interception |
+| **Frontend Web** | React 18, Vite, Tailwind CSS 4, Framer Motion, `@xyflow/react` | Interactive graph visualization, multimodal audit drawer, dynamic lab, dual theming |
 | **Security & Sandbox** | Multi-pattern regex redaction, path traversal guards, Docker | Strict execution isolation, API key sanitization, environment scrubbing |
 
 ---
@@ -168,7 +179,7 @@ flowchart LR
 ### Prerequisites
 * **Python:** 3.11 or later
 * **Node.js:** 18 or later (npm 9+)
-* **Google Gemini API Key (Optional):** Required only for Gemma AI explanations. All static analysis, graphs, predictions, and pytest experiments function 100% without an API key.
+* **Google Gemini API Key:** Required for Gemma 4 multimodal visual audits, dynamic scenario generation, and neuro-symbolic simulation. (An offline graceful fallback is included for local graph browsing).
 
 ### 1. Backend Setup
 ```bash
@@ -218,7 +229,7 @@ Open **`http://localhost:5173`** in your browser.
 DevDNA maintains a comprehensive automated test suite across backend algorithms, security boundaries, and UI components:
 
 ```bash
-# Run backend pytest suite (69 tests)
+# Run backend pytest suite (70 tests)
 cd backend && python -m pytest -v
 
 # Run frontend Vitest suite (12 tests)
@@ -232,19 +243,6 @@ cd frontend && npm run build
 
 ---
 
-## 10. 3-Minute Hackathon Demo Script
-
-| Time | View / Action | What to Point Out to Judges |
-| :--- | :--- | :--- |
-| **0:00** | Click **Explore Demo Project** | Real AST stages stream in (scanning files, parsing syntax trees, indexing calls, resolving routes). |
-| **0:25** | **Overview Dashboard** | Discovered 76 components and 109 relationships. Shows confirmed vs. inferred edges, and criticality distribution. |
-| **0:50** | **Architecture View** | Search for `get_connection`. Drawer reveals exact file/line, real source code excerpt, and incoming vs. outgoing dependencies. Press **Blast Radius** to illuminate the failure tree. |
-| **1:20** | **What-If Lab** $\rightarrow$ Database Unavailable | Select `sqlite` database. Dual Reverse BFS predicts 21 affected components, 6/6 routes down, 8 tests failing, 4 tests passing. |
-| **1:50** | **Explain with Gemma** | Consent modal previews exact redacted evidence tokens ($E_1 \dots E_{17}$). Gemma 4 explains failure mechanism while citing evidence tokens. |
-| **2:20** | **Validate in What-If Lab** | Run the experiment. Real pytest executes in ~6 seconds in the sandbox. **Verdict: Prediction Confirmed** (12/12 matches, fault triggered 8 times). |
-| **2:45** | **External API Unavailable** | Run scenario against payment provider. **Verdict: Partially Confirmed**. Explains why `test_order_validation` passed (FastAPI schema validation caught invalid payload before the handler ran). |
-
----
 
 ## 11. Global Keyboard Shortcuts
 
@@ -284,7 +282,7 @@ DEVDNA/
 │   │   ├── graph/              # NetworkX MultiDiGraph engine and Dual BFS
 │   │   ├── models/             # SQLAlchemy database models
 │   │   └── services/           # Findings rules, reports, graph serialization
-│   ├── tests/                  # 69 automated pytest unit and integration tests
+│   ├── tests/                  # 70 automated pytest unit and integration tests
 │   ├── sample_project/         # ShopLite reference e-commerce repository
 │   └── requirements.txt        # Backend dependencies
 ├── frontend/                   # React 18 + Vite Web Application
