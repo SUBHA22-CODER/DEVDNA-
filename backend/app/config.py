@@ -39,12 +39,20 @@ class Settings:
     max_uncompressed_bytes: int = field(default_factory=lambda: _int("DEVDNA_MAX_UNCOMPRESSED_MB", 500) * 1024 * 1024)
     max_compression_ratio: int = 100
     max_source_file_bytes: int = 512 * 1024
+    # Runtime trace uploads
+    max_trace_bytes: int = field(default_factory=lambda: _int("DEVDNA_MAX_TRACE_MB", 50) * 1024 * 1024)
     # Local repositories may only be analysed inside these roots (explicit opt-in).
     allowed_local_roots: list[str] = field(
         default_factory=lambda: [p for p in os.environ.get("DEVDNA_ALLOWED_LOCAL_ROOTS", "").split(os.pathsep) if p]
     )
     # Experiments
     experiment_timeout_s: int = field(default_factory=lambda: _int("DEVDNA_EXPERIMENT_TIMEOUT", 90))
+    # Opt-in API auth: when DEVDNA_API_TOKEN is set, every /api route except
+    # /api/health requires a matching X-DevDNA-Token header. Empty = local,
+    # unauthenticated mode (a startup warning is logged).
+    api_token: str = field(default_factory=lambda: os.environ.get("DEVDNA_API_TOKEN", "").strip())
+    # Simple per-IP request budget applied to /api routes.
+    rate_limit_per_minute: int = field(default_factory=lambda: _int("DEVDNA_RATE_LIMIT_PER_MINUTE", 120))
     # AI
     gemma_model: str = field(default_factory=lambda: os.environ.get("GEMMA_MODEL", "gemma-4-26b-a4b-it"))
     ai_timeout_s: int = field(default_factory=lambda: _int("DEVDNA_AI_TIMEOUT", 180))

@@ -4,6 +4,25 @@ import axios from 'axios'
 // Set VITE_API_URL to call a backend on another origin.
 const http = axios.create({ baseURL: import.meta.env.VITE_API_URL || '', timeout: 120000 })
 
+// Opt-in API auth: when the backend requires a token (DEVDNA_API_TOKEN), the
+// user sets it in Settings. Read from sessionStorage on every call so a
+// change applies immediately; never persisted to localStorage.
+const TOKEN_KEY = 'devdna.apiToken'
+http.interceptors.request.use((config) => {
+  const token = sessionStorage.getItem(TOKEN_KEY)
+  if (token) config.headers['X-DevDNA-Token'] = token
+  return config
+})
+
+export function setApiToken(token) {
+  if (token) sessionStorage.setItem(TOKEN_KEY, token)
+  else sessionStorage.removeItem(TOKEN_KEY)
+}
+
+export function hasApiToken() {
+  return Boolean(sessionStorage.getItem(TOKEN_KEY))
+}
+
 /** Turn any axios error into { status, code, message, fields }. */
 export function toApiError(err) {
   if (err?.response) {
@@ -39,9 +58,14 @@ export const api = {
   listProjects: () => call('get', '/api/projects'),
   getProject: (id) => call('get', `/api/projects/${id}`),
   loadSample: () => call('post', '/api/projects/sample'),
-  uploadZip: (file, onProgress) => {
+  loadGithub: (payload) => call('post', '/api/projects/github', payload),
+  uploadZip: ({ file, githubUrl, githubBranch }, onProgress) => {
     const form = new FormData()
     form.append('file', file)
+    if (githubUrl?.trim()) {
+      form.append('github_url', githubUrl.trim())
+      if (githubBranch?.trim()) form.append('github_branch', githubBranch.trim())
+    }
     return call('post', '/api/projects/upload', form, {
       onUploadProgress: (e) => onProgress?.(e.total ? e.loaded / e.total : 0),
     })
@@ -55,6 +79,10 @@ export const api = {
   component: (id, componentId) => call('get', `/api/projects/${id}/components/${componentId.split('/').map(enc).join('/')}`),
   findings: (id) => call('get', `/api/projects/${id}/findings`),
   updateFinding: (findingId, review_status) => call('patch', `/api/findings/${findingId}`, { review_status }),
+  suppressFinding: (findingId, payload) => call('post', `/api/findings/${findingId}/suppress`, payload),
+  unsuppressFinding: (findingId) => call('post', `/api/findings/${findingId}/unsuppress`),
+  findingSuppressionAudit: (findingId) => call('get', `/api/findings/${findingId}/suppression-audit`),
+  drift: (id) => call('get', `/api/projects/${id}/drift`),
   scenarios: (id) => call('get', `/api/projects/${id}/scenarios`),
   analytics: (id) => call('get', `/api/projects/${id}/analytics`),
 

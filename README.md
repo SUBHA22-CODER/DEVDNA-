@@ -39,7 +39,7 @@ In growing Python systems, answering a deceptively simple question is notoriousl
 DevDNA constructs a **Neuro-Symbolic Digital Twin** of any Python codebase. Unlike naive AI wrappers that hallucinate call graphs, or purely static tools that cannot reason about semantic runtime behavior, DevDNA fuses both paradigms:
 
 * **The Symbolic Engine (AST MultiDiGraph):** Mathematically maps dependencies, call sites, and exception handlers directly from syntax trees with zero hallucinations.
-* **The Neural Engine (Google Gemma 4):** Visually ingests architecture diagrams for drift detection, synthesizes arbitrary failure scenarios from natural language, calculates cascading runtime risk, and reconciles empirical test results.
+* **The Neural Engine (Google Gemma 4):** Visually ingests architecture diagrams for drift detection, synthesizes arbitrary failure scenarios from natural language, and reconciles empirical test results. The cascading risk score itself is a deterministic heuristic computed from the dependency graph — no AI model is used for this score, and it is not a failure probability.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -96,7 +96,7 @@ DevDNA constructs a **Neuro-Symbolic Digital Twin** of any Python codebase. Unli
    * Allows developers to express arbitrary failure modes in natural language (e.g., *"Redis connection drop & cache eviction storm"* or *"JWT token expiration cascade"*).
    * Gemma 4 inspects the AST code, identifies target components and exception hierarchies, and generates runtime fault specifications.
 3. **Neuro-Symbolic Blast Radius Engine:**
-   * Combines dual reverse graph reachability bounds with Gemma 4 runtime risk evaluation (0-100 risk score, semantic failure mechanisms, and unverified route coverage gaps).
+   * Combines dual reverse graph reachability bounds with a deterministic heuristic risk score (0-100; heuristic score, not a failure probability — no AI model is used for this score), with Gemma 4 contributing semantic failure mechanisms and unverified route coverage gap analysis.
    * Differentiates **Definite** paths from **Possible** (conditionally handled) paths.
 4. **Empirical What-If Lab (Controlled Fault Injection):**
    * Executes the repository's real `pytest` suite twice: baseline healthy run, then faulted run using the `devdna_faults` pytest plugin.
@@ -104,6 +104,10 @@ DevDNA constructs a **Neuro-Symbolic Digital Twin** of any Python codebase. Unli
 5. **Static AST Ingestion (Zero Code Execution During Ingestion):**
    * Uses Python's native `ast` module to scan functions, routes, database sessions, environment variable reads, and outbound HTTP clients.
    * Every discovered edge carries source file, line number, a redacted code snippet, and evidence classification (`confirmed` vs `inferred`).
+6. **Team Findings Workflow:**
+   * Assigns finding owners from the repository's `CODEOWNERS` file, falling back to the latest file blame/committer when available.
+   * Suppressions require a reason, accountable owner, and future expiry; they remain visible, are audited, and persist across analysis runs.
+   * The Findings page filters by owner and suppression status, while Overview compares route changes and growing component blast radii between runs.
 
 ---
 
@@ -213,7 +217,30 @@ uvicorn app.main:app --reload --port 8000
 ```
 *API interactive documentation is available at `http://127.0.0.1:8000/docs`.*
 
+Optional hardening (off by default): set `DEVDNA_API_TOKEN` in `backend/.env` to require an `X-DevDNA-Token` header on every `/api` call except `/api/health` (401 `unauthorized` otherwise), and `DEVDNA_RATE_LIMIT_PER_MINUTE` (default 120) for the per-IP request budget (429 `rate_limited`). When the token is set, paste it once in the frontend under Settings → "API access token"; it is stored for the current tab only. Without a token the server logs a startup warning that it is unauthenticated and localhost-only.
+
 ### 2. Frontend Setup
+For AST complexity scores, start the AST Engine in a separate terminal. The DevDNA API already uses port `8000`, so run the AST Engine on `8001` and point the frontend to it:
+
+```bash
+cd ast-engine
+python -m pip install -r requirements.txt
+uvicorn main:app --reload --port 8001
+```
+
+In `frontend/.env.local`, configure:
+```ini
+VITE_AST_ENGINE_URL=http://127.0.0.1:8001
+```
+
+The default AST Engine URL is `http://127.0.0.1:8001`; use `VITE_AST_ENGINE_URL` when it runs elsewhere. The AST Engine permits the local Vite origins by default. For another frontend origin, set `AST_ENGINE_CORS_ORIGINS` on the AST Engine to a comma-separated list of allowed origins. In the Upload ZIP tab, enter a public GitHub repository URL and branch to import and analyze it directly, or provide a ZIP file. In Local folder setup, the optional GitHub URL links that project to its AST complexity score.
+
+The standalone AST endpoint accepts a repository URL directly:
+```text
+http://127.0.0.1:8001/analyze/repo?github_url=https%3A%2F%2Fgithub.com%2Fowner%2Frepository&branch=main
+```
+The existing `owner`, `repo`, and `branch` query parameters remain supported.
+
 ```bash
 cd frontend
 npm install
@@ -229,10 +256,10 @@ Open **`http://localhost:5173`** in your browser.
 DevDNA maintains a comprehensive automated test suite across backend algorithms, security boundaries, and UI components:
 
 ```bash
-# Run backend pytest suite (70 tests)
+# Run backend pytest suite (74 tests)
 cd backend && python -m pytest -v
 
-# Run frontend Vitest suite (12 tests)
+# Run frontend Vitest suite (21 tests)
 cd frontend && npm test -- --run
 
 # Compile frontend production bundle
@@ -243,6 +270,21 @@ cd frontend && npm run build
 
 ---
 
+## 10. Pull Request Impact Check
+
+The static CLI analyzes changed Python files and reports impacted routes, tests predicted to fail, and impacted routes without a statically mapped predicted-failing test. It does not execute repository code or run experiments.
+
+```powershell
+cd backend
+$report = Join-Path $env:TEMP "devdna-impact.json"
+python -m app.cli sample_project --changed-file shoplite/db.py --json-output $report --fail-on-uncovered-route
+```
+
+Repeat `--changed-file` for multiple paths, or use `--changed-files-file` with one repository-relative path per line. With `--fail-on-uncovered-route`, the CLI exits with status `1` when an impacted route has no statically mapped predicted-failing test; otherwise it exits `0`. Markdown goes to standard output unless `--markdown-output` is supplied. JSON is written when `--json-output` is supplied.
+
+The [DevDNA PR Impact workflow](.github/workflows/pr-impact.yml) runs for pull requests and creates or updates one report comment. It analyzes the PR source statically and runs no project tests or experiments. Route coverage is heuristic and can miss dynamic or indirect test coverage.
+
+---
 
 ## 11. Global Keyboard Shortcuts
 
@@ -275,6 +317,7 @@ DEVDNA/
 │   └── SECURITY.md             # Threat model, sandboxing, and secret redaction
 ├── backend/                    # FastAPI Backend Service
 │   ├── app/
+│   │   ├── cli.py              # Static PR impact report CLI
 │   │   ├── ai/                 # Gemma 4 integration (gemma-4-26b-a4b-it, retry loop)
 │   │   ├── analyzer/           # Python AST parser, route resolver, redaction
 │   │   ├── api/                # REST endpoints (projects, predictions, experiments)
@@ -282,7 +325,7 @@ DEVDNA/
 │   │   ├── graph/              # NetworkX MultiDiGraph engine and Dual BFS
 │   │   ├── models/             # SQLAlchemy database models
 │   │   └── services/           # Findings rules, reports, graph serialization
-│   ├── tests/                  # 70 automated pytest unit and integration tests
+│   ├── tests/                  # 74 automated pytest unit and integration tests
 │   ├── sample_project/         # ShopLite reference e-commerce repository
 │   └── requirements.txt        # Backend dependencies
 ├── frontend/                   # React 18 + Vite Web Application
@@ -300,4 +343,4 @@ DEVDNA/
 
 ## 14. License
 
-DevDNA is developed by [SUBHA22-CODER](https://github.com/SUBHA22-CODER). All source code and documentation are provided for evaluation and open-source hackathon review.
+There is no `LICENSE` file in this repository yet. No license is granted until the repository owner chooses and adds one.

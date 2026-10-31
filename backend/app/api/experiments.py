@@ -11,19 +11,48 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import db as dbmod
-from app.api.deps import get_project, require_run
+from app.api.deps import get_project, pagination_params, require_run
 from app.db import get_db
-from app.ai.gemma import gemma
 from app.experiments.runner import choose_mode, compare, execute, fault_spec
 from app.graph.engine import compute_impact
 from app.models import Experiment, Prediction, Project
 from app.schemas import ExperimentIn, PredictionIn
 from app.services.analysis import load_graph
+from app.services.calibration import calibrate_impact, record_experiment_outcomes
 from app.services.serialize import experiment_out, prediction_out
 
 router = APIRouter(prefix="/api", tags=["predictions & experiments"])
 log = logging.getLogger("devdna.experiments")
 _exec_lock = threading.Lock()  # one experiment at a time per server process
+
+STALE_STATUSES = ("queued", "running")
+RESTART_ERROR = "Server restarted before this experiment finished — please re-run it."
+
+
+def recover_stale_experiments() -> int:
+    """Mark experiments left queued/running by a previous process as failed.
+
+    A restart kills the background task that would have finished them, so they
+    could never leave those states on their own. They are kept and marked
+    failed with a re-run hint — never silently re-run, never deleted. Safe to
+    call on every startup; a no-op when nothing is stale.
+    """
+    db = dbmod.SessionLocal()
+    try:
+        rows = db.scalars(select(Experiment).where(Experiment.status.in_(STALE_STATUSES))).all()
+        for exp in rows:
+            exp.status = "failed"
+            exp.error = RESTART_ERROR
+            exp.finished_at = datetime.now(timezone.utc)
+        if rows:
+            db.commit()
+            log.warning("Marked %d stale queued/running experiment(s) as failed after restart.", len(rows))
+        return len(rows)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @router.post("/projects/{project_id}/predictions", status_code=201)
@@ -36,18 +65,36 @@ def create_prediction(project_id: str, body: PredictionIn, db: Session = Depends
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "invalid_scenario", "message": str(exc)})
 
-    # DevDNA Neuro-Symbolic Failure Engine: Neural co-processor assessment
     definite_count = impact["summary"]["definite"]
     possible_count = impact["summary"]["possible"]
     routes_count = impact["summary"]["routes_affected"]
     tests_fail = impact["summary"]["tests_predicted_fail"]
-    raw_risk = min(100.0, (definite_count * 15.0) + (possible_count * 8.0) + (routes_count * 20.0))
-    risk_score = round(raw_risk, 1)
 
-    ai_simulation = {
-        "engine": "DevDNA Neuro-Symbolic Failure Engine",
-        "model": gemma.model if gemma.configured else "gemma-4-hybrid-engine",
-        "cascading_risk_score": risk_score,
+    # Calibrate risk score using empirically observed break rates from real experiment outcomes
+    cal_res = calibrate_impact(db, impact, body.scenario)
+    active_risk = cal_res["score"]
+    calibrated_risk = cal_res["calibrated_score"]
+    heuristic_risk = cal_res["heuristic_score"]
+    is_calibrated = cal_res["source"] == "calibrated"
+
+    deterministic_assessment = {
+        "engine": "DevDNA deterministic impact engine",
+        "model": None,
+        "ai_model_used": False,
+        "method": (
+            f"Calibrated empirical score ({calibrated_risk}) learned from {cal_res['sample_count']} experiment outcomes; "
+            f"heuristic score ({heuristic_risk}) retained during transition period for auditability; "
+            f"not an AI prediction and not a failure probability."
+            if is_calibrated else
+            f"Heuristic score from definite, possible, and affected-route counts; "
+            f"no outcome data for pattern yet (fallback to heuristic: {heuristic_risk}); "
+            f"not an AI prediction and not a failure probability."
+        ),
+        "cascading_risk_score": active_risk,
+        "calibrated_risk_score": calibrated_risk,
+        "heuristic_risk_score": heuristic_risk,
+        "score_source": cal_res["source"],
+        "calibration": cal_res,
         "semantic_summary": (
             f"Failure of '{impact['target']['name']}' under scenario '{impact['scenario_label']}' "
             f"directly endangers {routes_count} HTTP route(s) and cascades across {definite_count} definite "
@@ -63,10 +110,10 @@ def create_prediction(project_id: str, body: PredictionIn, db: Session = Depends
             [f"{tests_fail} test(s) predicted to fail, but {routes_count} user-facing route(s) have unverified error handling."]
             if tests_fail < routes_count else ["Adequate test suite mapping detected for reachable fault paths."]
         ),
-        "blast_radius_assessment": "CRITICAL" if risk_score > 70 else ("HIGH" if risk_score > 40 else "MODERATE"),
-        "neuro_symbolic": True,
+        "blast_radius_assessment": "CRITICAL" if active_risk > 70 else ("HIGH" if active_risk > 40 else "MODERATE"),
+        "neuro_symbolic": False,
     }
-    impact["neuro_symbolic_simulation"] = ai_simulation
+    impact["neuro_symbolic_simulation"] = deterministic_assessment
 
     pred = Prediction(project_id=p.id, run_id=run.id, scenario=body.scenario, target_id=body.target_id, impact=impact)
     db.add(pred)
@@ -75,9 +122,11 @@ def create_prediction(project_id: str, body: PredictionIn, db: Session = Depends
 
 
 @router.get("/projects/{project_id}/predictions")
-def list_predictions(project_id: str, db: Session = Depends(get_db)):
+def list_predictions(project_id: str, db: Session = Depends(get_db), params: tuple[int, int] = Depends(pagination_params)):
+    limit, offset = params
     get_project(db, project_id)
-    rows = db.scalars(select(Prediction).where(Prediction.project_id == project_id).order_by(Prediction.created_at.desc())).all()
+    rows = db.scalars(select(Prediction).where(Prediction.project_id == project_id)
+                      .order_by(Prediction.created_at.desc(), Prediction.id.desc()).offset(offset).limit(limit)).all()
     return [prediction_out(x) for x in rows]
 
 
@@ -111,6 +160,7 @@ def run_experiment(experiment_id: str) -> None:
         exp.comparison = comparison
         exp.status = comparison["status"]
         exp.finished_at = datetime.now(timezone.utc)
+        record_experiment_outcomes(db, exp, pred, comparison)
         db.commit()
     except Exception as exc:
         log.exception("experiment failed")
@@ -141,9 +191,11 @@ def start_experiment(prediction_id: str, body: ExperimentIn, background: Backgro
 
 
 @router.get("/projects/{project_id}/experiments")
-def list_experiments(project_id: str, db: Session = Depends(get_db)):
+def list_experiments(project_id: str, db: Session = Depends(get_db), params: tuple[int, int] = Depends(pagination_params)):
+    limit, offset = params
     get_project(db, project_id)
-    rows = db.scalars(select(Experiment).where(Experiment.project_id == project_id).order_by(Experiment.created_at.desc())).all()
+    rows = db.scalars(select(Experiment).where(Experiment.project_id == project_id)
+                      .order_by(Experiment.created_at.desc(), Experiment.id.desc()).offset(offset).limit(limit)).all()
     out = []
     for e in rows:
         item = experiment_out(e)
@@ -157,7 +209,22 @@ def list_experiments(project_id: str, db: Session = Depends(get_db)):
 
 @router.get("/experiments/{experiment_id}")
 def get_experiment(experiment_id: str, db: Session = Depends(get_db)):
-    e = db.get(Experiment, experiment_id)
-    if not e:
+    exp = db.get(Experiment, experiment_id)
+    if not exp:
         raise HTTPException(404, detail={"code": "experiment_not_found", "message": "Experiment not found"})
-    return experiment_out(e)
+    return experiment_out(exp)
+
+
+@router.get("/calibration/stats")
+def get_calibration_stats(db: Session = Depends(get_db)):
+    from app.models import PredictionOutcome
+    rows = db.scalars(select(PredictionOutcome)).all()
+    guarded = [r for r in rows if r.guard_present]
+    unguarded = [r for r in rows if not r.guard_present]
+    return {
+        "total_recorded": len(rows),
+        "guarded_count": len(guarded),
+        "guarded_break_rate": round(sum(1 for r in guarded if r.broke) / len(guarded), 3) if guarded else None,
+        "unguarded_count": len(unguarded),
+        "unguarded_break_rate": round(sum(1 for r in unguarded if r.broke) / len(unguarded), 3) if unguarded else None,
+    }

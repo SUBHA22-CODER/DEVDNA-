@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import db as dbmod
-from app.api import ai, architecture, experiments, projects, system
+from app.api import ai, architecture, experiments, guard, projects, system, traces
+from app.api.experiments import recover_stale_experiments
 from app.config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -21,6 +22,11 @@ async def lifespan(app: FastAPI):
     if dbmod.engine is None:
         dbmod.init_engine()
     settings.projects_dir.mkdir(parents=True, exist_ok=True)
+    recover_stale_experiments()
+    if not settings.api_token:
+        logging.getLogger("devdna").warning(
+            "DEVDNA_API_TOKEN is not set - the API is unauthenticated and intended for localhost use only."
+        )
     yield
 
 
@@ -30,6 +36,9 @@ app = FastAPI(
     description="AI-powered digital twin for software systems: discover, visualise, predict, experiment, compare.",
     lifespan=lifespan,
 )
+# Guard first (innermost) so CORS stays the outermost layer and error
+# responses still reach the browser with CORS headers attached.
+app.add_middleware(guard.GuardMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=False,
                    allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
 
@@ -54,5 +63,5 @@ async def unhandled(request: Request, exc: Exception):
                                                             "message": "Unexpected server error. Check the backend logs."}})
 
 
-for r in (system.router, projects.router, architecture.router, experiments.router, ai.router):
+for r in (system.router, projects.router, architecture.router, experiments.router, ai.router, traces.router):
     app.include_router(r)
